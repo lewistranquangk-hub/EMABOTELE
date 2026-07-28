@@ -62,8 +62,13 @@ _supply_cache = {}              # cache supply theo symbol trong 1 lần chạy
 # EXCHANGE
 # ---------------------------------------------------------------------------
 def get_exchange():
+    # Mặc định: Binance
     exchange = ccxt.binance({
         "enableRateLimit": True,
+        "options": {
+            "defaultType": "spot",
+            "fetchMarkets": ["spot"],  # KHÔNG gọi API Futures (fapi.binance.com) - cũng bị chặn 451 và không cần thiết
+        },
     })
     exchange.urls["api"]["public"] = "https://data-api.binance.vision/api/v3"
     return exchange
