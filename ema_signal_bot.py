@@ -62,9 +62,11 @@ _supply_cache = {}              # cache supply theo symbol trong 1 lần chạy
 # EXCHANGE
 # ---------------------------------------------------------------------------
 def get_exchange():
-    return ccxt.binance({
+    exchange = ccxt.binance({
         "enableRateLimit": True,
     })
+    exchange.urls["api"]["public"] = "https://data-api.binance.vision/api/v3"
+    return exchange
 
 
 def get_usdt_spot_symbols(exchange):
