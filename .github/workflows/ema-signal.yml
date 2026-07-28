@@ -1,0 +1,31 @@
+name: EMA Signal Bot
+
+on:
+  # Chạy ~20 phút trước mỗi lần đóng nến H4 (0h,4h,8h,12h,16h,20h UTC)
+  schedule:
+    - cron: '40 23,3,7,11,15,19 * * *'
+  # Cho phép bấm "Run workflow" thủ công để test
+  workflow_dispatch:
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Cài thư viện
+        run: pip install ccxt pandas requests
+
+      - name: Chạy quét 1 lần
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python ema_signal_bot.py --once
+
