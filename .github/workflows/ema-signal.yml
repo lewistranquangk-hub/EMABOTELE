@@ -7,6 +7,11 @@ on:
   # Cho phép bấm "Run workflow" thủ công để test
   workflow_dispatch:
 
+# Cần quyền ghi để bot tự lưu lại "đã báo tín hiệu nào" (sent_signals.json)
+# vào repo, tránh báo trùng ở lần quét sau.
+permissions:
+  contents: write
+
 jobs:
   scan:
     runs-on: ubuntu-latest
@@ -27,5 +32,19 @@ jobs:
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          # Đổi thành "coinbase" nếu Binance tiếp tục bị chặn (451).
+          # Lưu ý: Coinbase có rất ít altcoin nhỏ so với Binance.
+          EXCHANGE_ID: "binance"
         run: python ema_signal_bot.py --once
 
+      - name: Lưu lại trạng thái đã báo (chống báo trùng)
+        run: |
+          if [ -n "$(git status --porcelain sent_signals.json)" ]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git add sent_signals.json
+            git commit -m "Cập nhật trạng thái tín hiệu đã báo [skip ci]"
+            git push
+          else
+            echo "Không có thay đổi để lưu."
+          fi
