@@ -24,6 +24,7 @@ LƯU Ý QUAN TRỌNG:
 """
 
 import os
+import json
 import time
 import math
 import logging
@@ -43,6 +44,13 @@ TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 
 VN_TZ = timezone(timedelta(hours=7))  # UTC+7, cố định — không phụ thuộc giờ hệ thống server
+
+# File lưu lại các tín hiệu ĐÃ BÁO (coin + loại + khung + nến cụ thể), để
+# không báo trùng. File này được workflow GitHub Actions tự commit ngược lại
+# repo sau mỗi lần quét (xem ema-signal.yml) — nhờ đó "nhớ" xuyên suốt các
+# lần chạy dù mỗi lần GitHub Actions là môi trường hoàn toàn mới.
+STATE_FILE = os.environ.get("STATE_FILE", "sent_signals.json")
+STATE_MAX_AGE_DAYS = 35  # tự dọn key cũ hơn số ngày này để file không phình to mãi
 
 EXCHANGE_ID = os.environ.get("EXCHANGE_ID", "binance").lower()  # "binance" hoặc "coinbase"
 QUOTE = "USD" if EXCHANGE_ID == "coinbase" else "USDT"  # Coinbase dùng cặp .../USD, Binance dùng .../USDT
@@ -67,6 +75,49 @@ REQUEST_SLEEP = 0.25            # nghỉ giữa các request để tránh rate-l
 
 _coingecko_symbol_map = None    # cache mapping SYMBOL -> coingecko id
 _supply_cache = {}              # cache supply theo symbol trong 1 lần chạy
+
+
+# ---------------------------------------------------------------------------
+# STATE (chống báo trùng)
+# ---------------------------------------------------------------------------
+def load_sent_state():
+    if not os.path.exists(STATE_FILE):
+        return {"sent": {}}
+    try:
+        with open(STATE_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            data.setdefault("sent", {})
+            return data
+    except Exception as e:
+        log.warning(f"Không đọc được {STATE_FILE}, tạo mới: {e}")
+        return {"sent": {}}
+
+
+def save_sent_state(state):
+    try:
+        with open(STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump(state, f, ensure_ascii=False, indent=2, sort_keys=True)
+    except Exception as e:
+        log.error(f"Lỗi lưu {STATE_FILE}: {e}")
+
+
+def prune_sent_state(state, days=STATE_MAX_AGE_DAYS):
+    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+    sent = state.get("sent", {})
+    to_delete = []
+    for key, ts_str in sent.items():
+        try:
+            ts = datetime.fromisoformat(ts_str)
+        except Exception:
+            to_delete.append(key)
+            continue
+        if ts < cutoff:
+            to_delete.append(key)
+    for key in to_delete:
+        del sent[key]
+    if to_delete:
+        log.info(f"Đã dọn {len(to_delete)} tín hiệu cũ (>{days} ngày) khỏi state.")
+    return state
 
 
 # ---------------------------------------------------------------------------
@@ -242,11 +293,13 @@ def analyze_symbol(exchange, symbol):
         # =========================================================
         # TÍN HIỆU A — EMA20: báo riêng từng khung D / W (OR, không bắt buộc cả 2)
         # =========================================================
-        ema20_matches = []  # [(tf_label, ema20_val), ...]
+        ema20_matches = []  # [(tf_label, ema20_val, period_id), ...]
         if last_d_close > last_d_ema20:
-            ema20_matches.append(("D", last_d_ema20))
+            period_id_d = df_d.iloc[-1]["close_time"].strftime("%Y-%m-%d")
+            ema20_matches.append(("D", last_d_ema20, period_id_d))
         if last_w_close is not None and last_w_close > last_w_ema20:
-            ema20_matches.append(("W", last_w_ema20))
+            period_id_w = df_w.iloc[-1]["close_time"].strftime("%Y-%m-%d")
+            ema20_matches.append(("W", last_w_ema20, period_id_w))
         if ema20_matches:
             ema20_signal = {
                 "symbol": symbol,
@@ -279,7 +332,8 @@ def analyze_symbol(exchange, symbol):
                     continue
                 distance_pct = abs(price_ref - ema200_val) / ema200_val * 100
                 if distance_pct <= EMA200_PROXIMITY_PCT:
-                    ema200_matches.append((TF_LABELS[tf], ema200_val, distance_pct))
+                    period_id = df_tf.iloc[-1]["close_time"].strftime("%Y-%m-%dT%H:%M")
+                    ema200_matches.append((TF_LABELS[tf], ema200_val, distance_pct, period_id))
 
             if ema200_matches:
                 ema200_matches.sort(key=lambda m: m[2])  # gần nhất trước
@@ -312,7 +366,7 @@ def _supply_line(sig):
 
 def format_ema20_message(sig):
     now_str = datetime.now(VN_TZ).strftime("%d/%m %H:%M")
-    detail = "  |  ".join(f"{tf}: ${val:.6g}" for tf, val in sig["matches"])
+    detail = "  |  ".join(f"{tf}: ${val:.6g}" for tf, val, _pid in sig["matches"])
     return (
         f"📈 <b>EMA20 – {sig['symbol']}</b> ({_exchange_display_name()})\n"
         f"Giá: ${sig['price']:.6g}\n"
@@ -324,7 +378,7 @@ def format_ema20_message(sig):
 
 def format_ema200_message(sig):
     now_str = datetime.now(VN_TZ).strftime("%d/%m %H:%M")
-    detail = "  |  ".join(f"{tf} (cách {dist:.2f}%)" for tf, val, dist in sig["matches"])
+    detail = "  |  ".join(f"{tf} (cách {dist:.2f}%)" for tf, val, dist, _pid in sig["matches"])
     return (
         f"🎯 <b>Chạm EMA200 – {sig['symbol']}</b> ({_exchange_display_name()})\n"
         f"Giá: ${sig['price']:.6g}  |  Xu hướng: Tăng\n"
@@ -354,10 +408,48 @@ def send_telegram(text):
 # ---------------------------------------------------------------------------
 # VÒNG QUÉT CHÍNH
 # ---------------------------------------------------------------------------
+def _make_key(symbol, kind, tf, period_id):
+    return f"{symbol}|{kind}|{tf}|{period_id}"
+
+
+def dedupe_signals(signals, kind, sent):
+    """Với mỗi coin, chỉ giữ lại những khung (match) CHƯA từng báo cho đúng
+    kỳ nến đó. Nếu tất cả khung của coin đã báo rồi -> bỏ hẳn coin đó.
+    """
+    kept = []
+    for sig in signals:
+        fresh_matches = []
+        for m in sig["matches"]:
+            tf, *_rest, period_id = m  # period_id luôn là phần tử cuối
+            key = _make_key(sig["symbol"], kind, tf, period_id)
+            if key in sent:
+                continue  # đã báo đúng kỳ nến này rồi -> bỏ qua
+            fresh_matches.append(m)
+        if fresh_matches:
+            sig = dict(sig)
+            sig["matches"] = fresh_matches
+            kept.append(sig)
+    return kept
+
+
+def keys_for_signals(signals, kind):
+    """Sinh danh sách key 'đã báo' từ danh sách signal CUỐI CÙNG thực sự
+    được gửi đi (sau khi đã lọc trùng + lọc supply...). Chỉ những coin thật
+    sự gửi Telegram mới bị đánh dấu, tránh đánh dấu nhầm coin bị loại vì lý
+    do khác (vd: supply lớn) — để lần sau vẫn được xét lại bình thường.
+    """
+    keys = []
+    for sig in signals:
+        for m in sig["matches"]:
+            tf, *_rest, period_id = m
+            keys.append(_make_key(sig["symbol"], kind, tf, period_id))
+    return keys
+
+
 def attach_supply_info(signals):
     """Tra Total Supply cho từng coin đã thỏa điều kiện, gắn vào sig để hiển thị.
-    KHÔNG loại bỏ coin nào theo supply — kể cả supply >= 2 tỷ vẫn được báo
-    nếu đã thỏa các điều kiện khác. Nếu không tra được dữ liệu, hiển thị N/A.
+    KHÔNG tự loại bỏ coin nào ở bước này — việc có lọc theo supply hay
+    không tùy vào từng loại tín hiệu, xử lý riêng ở run_scan().
     """
     for sig in signals:
         base = sig["symbol"].split("/")[0]
@@ -373,32 +465,51 @@ def run_scan():
     symbols = get_usdt_spot_symbols(exchange)
     log.info(f"Tổng số cặp {QUOTE} cần quét: {len(symbols)}")
 
+    state = load_sent_state()
+    state = prune_sent_state(state)
+    sent = state["sent"]
+
     ema20_signals = []
     ema200_signals = []
     for i, symbol in enumerate(symbols):
         s_ema20, s_ema200 = analyze_symbol(exchange, symbol)
         if s_ema20:
             ema20_signals.append(s_ema20)
-            log.info(f"📈 EMA20: {symbol}")
         if s_ema200:
             ema200_signals.append(s_ema200)
-            log.info(f"🎯 EMA200: {symbol}")
         time.sleep(REQUEST_SLEEP)
         if (i + 1) % 50 == 0:
             log.info(f"Đã quét {i + 1}/{len(symbols)}")
 
-    # Tra Total Supply để hiển thị (chỉ tra cho coin đã thỏa điều kiện, đỡ tốn request)
+    log.info(f"Trước khi lọc trùng: EMA20={len(ema20_signals)} | EMA200={len(ema200_signals)}")
+
+    # Bỏ qua những khung/coin đã báo đúng kỳ nến này rồi (vd: BOME EMA20 W
+    # tuần này đã báo thì không báo lại, tới tuần sau có nến W mới mới báo tiếp)
+    ema20_signals = dedupe_signals(ema20_signals, "EMA20", sent)
+    ema200_signals = dedupe_signals(ema200_signals, "EMA200", sent)
+
+    log.info(f"Sau khi lọc trùng: EMA20={len(ema20_signals)} | EMA200={len(ema200_signals)}")
+
+    # Tra Total Supply để hiển thị (chỉ tra cho coin còn lại sau khi lọc trùng)
     ema20_signals = attach_supply_info(ema20_signals)
     ema200_signals = attach_supply_info(ema200_signals)
 
+    # CHỈ RIÊNG tín hiệu EMA20: lọc thêm điều kiện Total Supply < 2 tỷ.
+    # Biết chắc supply >= 2 tỷ -> loại. Không tra được dữ liệu (None) -> vẫn
+    # giữ để báo, không vì thiếu dữ liệu mà bỏ sót tín hiệu.
+    # (Tín hiệu EMA200 KHÔNG áp dụng bộ lọc này, vẫn giữ nguyên như cũ.)
+    before_ema20 = len(ema20_signals)
+    ema20_signals = [s for s in ema20_signals if s.get("supply_under") is not False]
+    log.info(f"Lọc Total Supply <2 tỷ (chỉ EMA20): {before_ema20} -> {len(ema20_signals)}")
+
     if not ema20_signals and not ema200_signals:
-        log.info("Không có coin nào thỏa mãn.")
-        if SEND_NO_SIGNAL_MESSAGE:
-            send_telegram("Hiện tại không có coin nào thỏa mãn đầy đủ điều kiện.")
+        log.info("Không có tín hiệu MỚI nào (có thể đã báo hết trước đó).")
         return
 
     # Sắp EMA200 theo khoảng cách gần nhất trước (dựa vào khung khớp gần nhất)
     ema200_signals.sort(key=lambda s: s["matches"][0][2])
+
+    now_iso = datetime.now(timezone.utc).isoformat()
 
     for sig in ema20_signals:
         send_telegram(format_ema20_message(sig))
@@ -407,7 +518,14 @@ def run_scan():
         send_telegram(format_ema200_message(sig))
         time.sleep(1)
 
-    log.info(f"Hoàn tất. EMA20: {len(ema20_signals)} | EMA200: {len(ema200_signals)}")
+    # Đánh dấu đã báo (chỉ những coin THỰC SỰ được gửi) + lưu lại state
+    ema20_new_keys = keys_for_signals(ema20_signals, "EMA20")
+    ema200_new_keys = keys_for_signals(ema200_signals, "EMA200")
+    for key in ema20_new_keys + ema200_new_keys:
+        sent[key] = now_iso
+    save_sent_state(state)
+
+    log.info(f"Hoàn tất. Đã gửi EMA20: {len(ema20_signals)} | EMA200: {len(ema200_signals)}")
 
 
 def seconds_until_next_run():
